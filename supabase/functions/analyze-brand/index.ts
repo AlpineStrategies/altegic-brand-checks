@@ -1,135 +1,144 @@
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import { Configuration, OpenAIApi } from 'https://esm.sh/openai@3.1.0'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Content-Type': 'application/json'
 }
 
 serve(async (req) => {
+  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders
+    })
   }
 
   try {
-    if (req.method !== 'POST') {
-      throw new Error('Method not allowed')
-    }
+    const { brandId, userId, brandBookPath, marketingMaterialPath } = await req.json()
 
+    // Initialize Supabase client
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SERVICE_ROLE_KEY_SUPA') ?? ''
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     )
 
-    const openai = new OpenAIApi(new Configuration({
-      apiKey: Deno.env.get('OPENAI_API_KEY'),
-    }))
+    // Download files from storage
+    const [brandBookData, marketingMaterialData] = await Promise.all([
+      supabaseClient.storage
+        .from('documents')
+        .download(brandBookPath),
+      supabaseClient.storage
+        .from('documents')
+        .download(marketingMaterialPath)
+    ]);
 
-    const formData = await req.formData()
-    const brandBook = formData.get('brandBook') as File
-    const marketingMaterial = formData.get('marketingMaterial') as File
-    const brandId = formData.get('brandId') as string
-    const userId = formData.get('userId') as string
-
-    if (!brandBook || !marketingMaterial || !brandId || !userId) {
-      throw new Error('Missing required fields')
+    if (!brandBookData.data || !marketingMaterialData.data) {
+      throw new Error('Failed to download files');
     }
 
-    // Ensure bucket exists
-    const { data: buckets } = await supabaseClient.storage.listBuckets()
-    if (!buckets?.some(b => b.name === 'brand-files')) {
-      await supabaseClient.storage.createBucket('brand-files', { public: false })
-    }
+    // Process the files (implement your analysis logic here)
+    // This is where you'd analyze the PDFs
+    const analysisResults = await analyzeDocuments(brandBookData.data, marketingMaterialData.data);
 
-    // Process files
-    const timestamp = Date.now()
-    const [brandBookText, marketingMaterialText] = await Promise.all([
-      brandBook.text(),
-      marketingMaterial.text(),
-    ])
-
-    const [brandBookPath, materialPath] = await Promise.all([
-      uploadFile(supabaseClient, brandBook, `brands/${brandId}/guidelines/${timestamp}.pdf`),
-      uploadFile(supabaseClient, marketingMaterial, `brands/${brandId}/materials/${timestamp}.pdf`),
-    ])
-
-    // Save brand guidelines
-    const { error: guidelinesError } = await supabaseClient
-      .from('brand_guidelines')
+    // Store results in database
+    const { data, error } = await supabaseClient
+      .from('compliance_reports')
       .insert({
         brand_id: brandId,
-        file_path: brandBookPath,
-        content: brandBookText,
-        active: true,
-      })
-
-    if (guidelinesError) throw guidelinesError
-
-    // Analyze with OpenAI
-    const completion = await openai.createChatCompletion({
-      model: 'gpt-4',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a brand compliance expert. Analyze the provided brand guidelines and marketing material for inconsistencies in fonts, colors, layout, and other brand elements.',
-        },
-        {
-          role: 'user',
-          content: `Brand Guidelines:\n${brandBookText}\n\nMarketing Material:\n${marketingMaterialText}\n\nAnalyze the marketing material for compliance with the brand guidelines. Focus on fonts, colors, layout, and logo usage. Provide a compliance score and list specific issues with recommendations.`,
-        },
-      ],
-    })
-
-    const report = parseAIResponse(completion.data.choices[0].message?.content || '')
-
-    // Save analysis report
-    const { data: savedReport, error: reportError } = await supabaseClient
-      .from('analysis_reports')
-      .insert({
-        brand_id: brandId,
-        material_file_path: materialPath,
-        score: report.score,
         user_id: userId,
+        results: analysisResults,
+        status: 'completed'
       })
       .select()
-      .single()
+      .single();
 
-    if (reportError) throw reportError
+    if (error) throw error;
 
-    // Save analysis issues
-    const issues = report.issues.map(issue => ({
-      report_id: savedReport.id,
-      ...issue,
-    }))
-
-    const { error: issuesError } = await supabaseClient
-      .from('analysis_issues')
-      .insert(issues)
-
-    if (issuesError) throw issuesError
-
-    return new Response(
-      JSON.stringify({
-        ...report,
-        id: savedReport.id,
-        created_at: savedReport.created_at,
-      }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    )
-  } catch (error) {
-    console.error('Function error:', error)
     return new Response(
       JSON.stringify({ 
-        error: error instanceof Error ? error.message : 'An unexpected error occurred' 
+        message: 'Analysis completed',
+        reports: [data]
       }),
-      {
-        status: error instanceof Error && error.message === 'Method not allowed' ? 405 : 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+      { headers: corsHeaders }
+    )
+
+  } catch (error) {
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { headers: corsHeaders, status: 500 }
     )
   }
 })
+
+async function analyzeDocuments(brandBookBlob: Blob, marketingMaterialBlob: Blob) {
+  // Convert blobs to text
+  const [brandBookText, marketingMaterialText] = await Promise.all([
+    brandBookBlob.text(),
+    marketingMaterialBlob.text()
+  ]);
+
+  // Initialize OpenAI
+  const openai = new OpenAIApi(new Configuration({
+    apiKey: Deno.env.get('OPENAI_API_KEY'),
+  }));
+
+  // Get analysis from OpenAI
+  const completion = await openai.createChatCompletion({
+    model: 'gpt-4',
+    messages: [
+      {
+        role: 'system',
+        content: `You are a brand compliance expert. Analyze brand guidelines and marketing materials 
+                 for inconsistencies in fonts, colors, layout, logos, tone of voice, and other brand elements.
+                 Provide detailed feedback with specific examples.`
+      },
+      {
+        role: 'user',
+        content: `Brand Guidelines:\n${brandBookText}\n\nMarketing Material:\n${marketingMaterialText}
+                 \n\nAnalyze the marketing material for compliance with the brand guidelines.
+                 Focus on: fonts, colors, layout, logo usage, imagery style, and tone of voice.
+                 Provide a compliance score (0-100) and list specific issues with recommendations.
+                 Format your response as JSON with the following structure:
+                 {
+                   "score": number,
+                   "summary": string,
+                   "issues": Array<{
+                     severity: "High" | "Medium" | "Low",
+                     category: string,
+                     description: string,
+                     recommendation: string
+                   }>
+                 }`
+      }
+    ],
+    temperature: 0.7,
+    max_tokens: 2000
+  });
+
+  const analysisText = completion.data.choices[0].message?.content;
+  if (!analysisText) {
+    throw new Error('Failed to get analysis from OpenAI');
+  }
+
+  try {
+    const analysis = JSON.parse(analysisText);
+    return {
+      score: analysis.score,
+      summary: analysis.summary,
+      issues: analysis.issues,
+      analyzed_at: new Date().toISOString(),
+      status: 'completed'
+    };
+  } catch (error) {
+    console.error('Error parsing OpenAI response:', error);
+    throw new Error('Failed to parse analysis results');
+  }
+}
 
 async function uploadFile(
   supabase: any,
